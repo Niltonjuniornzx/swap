@@ -22,7 +22,7 @@ Outros comandos: `swappiness 10`, `enable`, `disable`, `remove`, `help`.
 
 - O tamanho define a capacidade máxima **deste arquivo**, em GiB. Outras swaps, inclusive zram, permanecem independentes e podem aumentar a capacidade total.
 - Swappiness (0–200) ajusta a preferência relativa entre trocar páginas de memória e recuperar cache; não é porcentagem de RAM nem um gatilho exato de uso.
-- Usa somente `/var/lib/swap-manager/swapfile`, com permissão 600, e mantém entrada própria em fstab.
+- Alterna entre `swapfile` e `swapfile-next` dentro de `/var/lib/swap-manager`, com permissão 600, e mantém entrada própria em fstab.
 - Ao redimensionar, cria e ativa o novo arquivo antes de desativar o antigo. Precisa de espaço para ambos; mantém pelo menos 1 GiB livre.
 - Btrfs usa o comando próprio para criar arquivo sem holes/compressão e com NOCOW. Não inclua o arquivo em snapshots.
 - Se swapoff falhar, o arquivo em uso é preservado. Desativar swap pode pressionar a RAM; não execute durante falta de memória.

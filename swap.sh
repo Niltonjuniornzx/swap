@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+DIR=/var/lib/swap-manager
+CONF=/etc/sysctl.d/99-swap-manager.conf
+die() { echo "ERRO: $*" >&2; exit 1; }
+root() {
+  (( EUID == 0 )) || die "Execute com sudo bash $0"
+  for c in flock swapon swapoff mkswap findmnt df awk sysctl; do
+    command -v "$c" >/dev/null || die "Comando necessário: $c"
+  done
+  [[ ! -L "$DIR" ]] || die "Diretório não pode ser link simbólico."
+  mkdir -p "$DIR" /etc/sysctl.d
+  chmod 700 "$DIR"
+  exec 9>"$DIR/lock"
+  flock -n 9 || die "Outro gerenciador está executando."
+}
+active() { swapon --show=NAME --noheadings --raw | awk -v p="$1" '$0==p {found=1} END {exit !found}'; }
+owned_files() {
+  local p
+  for p in "$DIR/swapfile" "$DIR/swapfile-next"; do
+    [[ ! -L "$p" ]] || die "Arquivo de swap não pode ser link."
+    [[ ! -e "$p" || -f "$p" ]] || die "Caminho inválido: $p"
+  done
+}
+status() {
+  free -h
+  echo
+  swapon --show
+  echo "Swappiness: $(sysctl -n vm.swappiness)"
+}
+valid_swappiness() { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( 10#$1 <= 200 )); }
+set_swappiness() {
+  local value=$1 previous tmp
+  valid_swappiness "$value" || die "Swappiness deve ser 0–200."
+  value=$((10#$value))
+  if [[ -e "$CONF" ]] && ! rg_marker "$CONF"; then die "Configuração sysctl já existe e não pertence ao gerenciador."; fi
+  previous=$(sysctl -n vm.swappiness)
+  [[ -e "$DIR/previous-swappiness" ]] || printf '%s\n' "$previous" > "$DIR/previous-swappiness"
+  tmp=$(mktemp /etc/sysctl.d/.swap-manager.XXXXXX)
+  printf '# swap-manager\nvm.swappiness=%s\n' "$value" > "$tmp"
+  chmod 644 "$tmp"
+  sysctl -w "vm.swappiness=$value" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CONF"
+  printf '%s\n' "$value" > "$DIR/last-swappiness"
+}
+rg_marker() { head -n 1 "$1" | awk '$0=="# swap-manager" {ok=1} END {exit !ok}'; }
+fstab() {
+  local target=${1:-} tmp backup
+  [[ -f /etc/fstab && ! -L /etc/fstab ]] || die "/etc/fstab ausente ou não regular."
+  tmp=$(mktemp /etc/.fstab-swap-manager.XXXXXX)
+  backup=$(mktemp "$DIR/fstab-backup.XXXXXX")
+  cp -p /etc/fstab "$backup"
+  awk -v a="$DIR/swapfile" -v b="$DIR/swapfile-next" '$1!=a && $1!=b {print}' /etc/fstab > "$tmp"
+  [[ -z "$target" ]] || printf '%s none swap sw 0 0\n' "$target" >> "$tmp"
+  chmod --reference=/etc/fstab "$tmp"
+  chown --reference=/etc/fstab "$tmp"
+  mv -f "$tmp" /etc/fstab
+}
+configure() {
+  local gib=${1:-} tendency=${2:-10} old='' new bytes available fs p
+  [[ "$gib" =~ ^[0-9]{1,6}$ ]] && (( 10#$gib >= 1 && 10#$gib <= 104857 )) || die "Tamanho: 1–104857 GiB inteiros."
+  valid_swappiness "$tendency" || die "Swappiness deve ser 0–200."
+  owned_files
+  for p in "$DIR/swapfile" "$DIR/swapfile-next"; do
+    if [[ -e "$p" ]]; then
+      [[ -z "$old" ]] || die "Dois arquivos existentes. Use disable/remove antes de configurar novamente."
+      old=$p
+    fi
+  done
+  new="$DIR/swapfile"
+  [[ "$old" != "$new" ]] || new="$DIR/swapfile-next"
+  bytes=$((10#$gib * 1073741824))
+  available=$(df -B1 --output=avail "$DIR" | awk 'NR==2 {print $1}')
+  (( available >= bytes + 1073741824 )) || die "Espaço insuficiente: precisa do tamanho solicitado + 1 GiB livre."
+  fs=$(findmnt -n -o FSTYPE -T "$DIR")
+  case "$fs" in ext4|ext3|ext2|xfs|btrfs) ;; *) die "Filesystem $fs não suportado automaticamente." ;; esac
+  echo "Criando $gib GiB em $new..."
+  (
+    trap 'if ! active "$new"; then rm -f -- "$new"; fi' EXIT
+    umask 077
+    if [[ "$fs" == btrfs ]]; then
+      command -v btrfs >/dev/null || die "Instale btrfs-progs."
+      btrfs filesystem mkswapfile --size "$bytes" "$new" || exit 1
+    else
+      dd if=/dev/zero of="$new" bs=1M count=$((10#$gib * 1024)) status=progress || exit 1
+      chmod 600 "$new"
+      mkswap "$new" || exit 1
+    fi
+    chmod 600 "$new"
+    swapon "$new" || exit 1
+    if [[ -n "$old" ]] && active "$old"; then
+      if ! swapoff "$old"; then
+        echo "Swap antiga preservada. Tentando desfazer a nova." >&2
+        swapoff "$new" || echo "Nova swap continua ativa; arquivos preservados. Execute status." >&2
+        exit 1
+      fi
+    fi
+    fstab "$new" || exit 1
+    [[ -z "$old" ]] || rm -f -- "$old"
+    set_swappiness "$tendency" || exit 1
+  )
+  local result=$?
+  (( result == 0 )) || return "$result"
+  echo "Swap configurada e persistida."
+  status
+}
+disable() {
+  local p
+  owned_files
+  for p in "$DIR/swapfile" "$DIR/swapfile-next"; do
+    if active "$p"; then swapoff "$p" || die "Não foi possível desativar $p; arquivo preservado."; fi
+  done
+  fstab
+  echo "Swap do gerenciador desativada, inclusive na inicialização."
+}
+enable() {
+  local p found=''
+  owned_files
+  for p in "$DIR/swapfile" "$DIR/swapfile-next"; do
+    if [[ -f "$p" ]]; then
+      [[ -z "$found" ]] || die "Dois arquivos existentes; resolva antes de ativar."
+      found=$p
+    fi
+  done
+  [[ -n "$found" ]] || die "Crie uma swap primeiro."
+  chmod 600 "$found"
+  active "$found" || swapon "$found"
+  fstab "$found"
+}
+remove() {
+  disable
+  rm -f -- "$DIR/swapfile" "$DIR/swapfile-next"
+  if [[ -f "$CONF" ]] && rg_marker "$CONF"; then
+    if [[ -f "$DIR/previous-swappiness" && -f "$DIR/last-swappiness" ]] && [[ "$(sysctl -n vm.swappiness)" == "$(cat "$DIR/last-swappiness")" ]]; then
+      sysctl -w "vm.swappiness=$(cat "$DIR/previous-swappiness")"
+    fi
+    rm -f "$CONF" "$DIR/previous-swappiness" "$DIR/last-swappiness"
+  fi
+  echo "Configuração removida. Backups de fstab preservados em $DIR."
+}
+help() {
+  echo "Uso: sudo bash $0 [configure GiB [swappiness] | swappiness 0–200 | enable | disable | remove | status | help]"
+  echo "Sem argumentos: menu. Tamanho limita este arquivo; outras swaps continuam independentes."
+}
+menu() {
+  local option size tendency confirm
+  while true; do
+    echo
+    echo '=== Gerenciador de Swap Linux ==='
+    status
+    printf '\n1. Criar/redimensionar\n2. Ajustar swappiness\n3. Ativar\n4. Desativar\n5. Remover\n0. Sair\n'
+    read -r -p 'Opção: ' option || return 0
+    case "$option" in
+      1) read -r -p 'Capacidade em GiB (ex.: 8): ' size; read -r -p 'Swappiness (0–200, padrão 10): ' tendency; configure "$size" "${tendency:-10}" ;;
+      2) read -r -p 'Swappiness (0–200): ' tendency; set_swappiness "$tendency" ;;
+      3) enable ;;
+      4|5) read -r -p 'Isso pode pressionar a RAM. Confirme digitando SIM: ' confirm; [[ "$confirm" != SIM ]] || { if [[ "$option" == 4 ]]; then disable; else remove; fi; } ;;
+      0) return ;;
+      *) echo 'Opção inválida.' ;;
+    esac
+  done
+}
+main() {
+  case "${1:-menu}" in
+    help|--help|-h) help ;;
+    status) status ;;
+    configure) [[ $# -ge 2 && $# -le 3 ]] || die "Use configure GiB [swappiness]."; root; configure "$2" "${3:-10}" ;;
+    swappiness) [[ $# == 2 ]] || die "Use swappiness 0–200."; root; set_swappiness "$2" ;;
+    enable|disable|remove) [[ $# == 1 ]] || die "Argumentos inesperados."; root; "$1" ;;
+    menu) root; menu ;;
+    *) help; exit 1 ;;
+  esac
+}
+main "$@"

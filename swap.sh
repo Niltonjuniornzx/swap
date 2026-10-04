@@ -23,11 +23,44 @@ owned_files() {
     [[ ! -e "$p" || -f "$p" ]] || die "Caminho inválido: $p"
   done
 }
+ui_init() {
+  UI_CYAN='' UI_GREEN='' UI_BOLD='' UI_RESET=''
+  if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+    UI_CYAN=$'\033[36m' UI_GREEN=$'\033[32m' UI_BOLD=$'\033[1m' UI_RESET=$'\033[0m'
+  fi
+}
+ui_line() { printf '%s%s%s\n' "$UI_CYAN" "$1" "$UI_RESET"; }
+ui_row() {
+  # Width counts Unicode characters using awk, even with LC_ALL=C.
+  local value=$1 length padding
+  length=$(printf '%s' "$value" | od -An -tu1 | awk '{for(i=1;i<=NF;i++) if($i<128 || $i>=192) n++} END {print n+0}')
+  padding=$((46-length))
+  (( padding >= 0 )) || padding=0
+  printf '%s║%s %s%*s %s║%s\n' "$UI_CYAN" "$UI_RESET" "$value" "$padding" '' "$UI_CYAN" "$UI_RESET"
+}
+ui_metric() {
+  local length
+  length=$(printf '%s' "$1" | od -An -tu1 | awk '{for(i=1;i<=NF;i++) if($i<128 || $i>=192) n++} END {print n+0}')
+  ui_row "$(printf '%s%*s%s' "$1" "$((24-length))" '' "$2")"
+}
 status() {
-  free -h
-  echo
-  swapon --show
-  echo "Swappiness: $(sysctl -n vm.swappiness)"
+  local ram used available swap swap_used tendency
+  read -r ram used available swap swap_used < <(awk '
+    /^MemTotal:/ {m=$2} /^MemAvailable:/ {a=$2}
+    /^SwapTotal:/ {s=$2} /^SwapFree:/ {f=$2}
+    END {printf "%.2f %.2f %.2f %.2f %.2f\n",m/1048576,(m-a)/1048576,a/1048576,s/1048576,(s-f)/1048576}
+  ' /proc/meminfo)
+  tendency=$(sysctl -n vm.swappiness)
+  ui_line '╔════════════════════════════════════════════════╗'
+  ui_row "             Linux Swap Manager"
+  ui_line '╠════════════════════════════════════════════════╣'
+  ui_metric 'RAM instalada:' "$ram GiB"
+  ui_metric 'RAM em uso (estimada):' "$used GiB"
+  ui_metric 'RAM disponível:' "$available GiB"
+  ui_metric 'Swap total:' "$swap GiB"
+  ui_metric 'Swap usada:' "$swap_used GiB"
+  ui_metric 'Swappiness:' "$tendency / 200"
+  ui_line '╚════════════════════════════════════════════════╝'
 }
 valid_swappiness() { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( 10#$1 <= 200 )); }
 set_swappiness() {
@@ -144,21 +177,31 @@ help() {
   echo "Sem argumentos: menu. Tamanho limita este arquivo; outras swaps continuam independentes."
 }
 menu() {
-  local option size tendency confirm
+  local option size tendency confirm pause
   while true; do
-    echo
-    echo '=== Gerenciador de Swap Linux ==='
+    if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
     status
-    printf '\n1. Criar/redimensionar\n2. Ajustar swappiness\n3. Ativar\n4. Desativar\n5. Remover\n0. Sair\n'
-    read -r -p 'Opção: ' option || return 0
+    ui_line '╔════════════════════════════════════════════════╗'
+    ui_row '1. Criar / alterar Swap'
+    ui_row '2. Definir Swappiness'
+    ui_row '3. Ativar Swap'
+    ui_row '4. Mostrar uso detalhado'
+    ui_row '5. Desativar Swap'
+    ui_row '6. Remover configuração'
+    ui_row '0. Sair'
+    ui_line '╚════════════════════════════════════════════════╝'
+    printf '\n%sEscolha uma opção [0–6]%s\n' "$UI_GREEN" "$UI_RESET"
+    read -r -p '➜ ' option || return 0
     case "$option" in
       1) read -r -p 'Capacidade em GiB (ex.: 8): ' size; read -r -p 'Swappiness (0–200, padrão 10): ' tendency; configure "$size" "${tendency:-10}" ;;
       2) read -r -p 'Swappiness (0–200): ' tendency; set_swappiness "$tendency" ;;
       3) enable ;;
-      4|5) read -r -p 'Isso pode pressionar a RAM. Confirme digitando SIM: ' confirm; [[ "$confirm" != SIM ]] || { if [[ "$option" == 4 ]]; then disable; else remove; fi; } ;;
+      4) status; printf '\n'; swapon --show ;;
+      5|6) read -r -p 'Isso pode pressionar a RAM. Confirme digitando SIM: ' confirm; [[ "$confirm" != SIM ]] || { if [[ "$option" == 5 ]]; then disable; else remove; fi; } ;;
       0) return ;;
       *) echo 'Opção inválida.' ;;
     esac
+    read -r -p 'Pressione Enter para voltar ao menu...' pause || return 0
   done
 }
 main() {
@@ -172,4 +215,5 @@ main() {
     *) help; exit 1 ;;
   esac
 }
+ui_init
 main "$@"
